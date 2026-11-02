@@ -1,0 +1,873 @@
+-- FUT Hub complete source
+local previous=getgenv().FUTHubBundle
+if previous and previous.Cleanup then previous.Cleanup() end
+local bundle={states={}}
+getgenv().FUTHubBundle=bundle
+function bundle.Cleanup()
+ for i=#bundle.states,1,-1 do
+  local s=bundle.states[i]
+  s.live=false
+  for _,conn in s.connections do pcall(function() conn:Disconnect() end) end
+  for j=#s.cleanups,1,-1 do pcall(s.cleanups[j]) end
+ end
+ table.clear(bundle.states)
+end
+local function createState()
+ local s={live=true,connections={},cleanups={}}
+ local api={}
+ function api.alive() return s.live end
+ function api.connect(signal,fn)
+  local conn=signal:Connect(fn)
+  table.insert(s.connections,conn)
+  return conn
+ end
+ function api.onCleanup(fn) table.insert(s.cleanups,fn) end
+ table.insert(bundle.states,s)
+ return api
+end
+
+do
+local STATE=createState()
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local player = Players.LocalPlayer
+local gameFolder = workspace:FindFirstChild("Game") :: any
+local engine = gameFolder.Engine
+local goals = gameFolder.PitchEngine.Goals
+local enabled = true
+local config = {
+ Radius = 32,
+ MaxDiveReach = 17,
+ MinLeadTime = 0.16,
+ MaxLeadTime = 0.28,
+ LowLeadTime = 0.30,
+ Cooldown = 0.85,
+ JumpDive = true,
+ JumpHeight = 3.5,
+ JumpDelay = 0.09,
+}
+getgenv().FUTAutoDiveConfig = config
+local samples = {}
+local lastDive = 0
+local held = {}
+local stats = {enabled=true, dives=0, last="Waiting for a shot", prediction="No incoming shot"}
+getgenv().FUTAutoDive = stats
+stats.SetEnabled=function(value)
+ enabled=value
+ stats.enabled=value
+end
+local function release()
+ for key in held do keyrelease(key) end
+ table.clear(held)
+end
+STATE.onCleanup(function() release(); stats.enabled=false end)
+STATE.connect(UIS.InputBegan,function(input,processed)
+ if not processed and input.KeyCode == Enum.KeyCode.G then
+  enabled = not enabled
+  stats.enabled=enabled
+  if not enabled then release() end
+  print("FUT auto dive: "..tostring(enabled))
+ end
+end)
+STATE.connect(RunService.Heartbeat,function(dt)
+ local now=os.clock()
+ local character=player.Character
+ local root=character and character:FindFirstChild("HumanoidRootPart")
+ if not root then return end
+ local best=nil
+ stats.prediction="No incoming shot"
+ for _,ball in engine:GetChildren() do
+  if ball:IsA("BasePart") and ball.Name=="Ball" then
+   local pos=ball.Position
+   local previous=samples[ball]
+   samples[ball]={pos=pos,time=now,velocity=previous and previous.velocity}
+   if previous then
+    local elapsed=now-previous.time
+    if elapsed>0.005 and elapsed<0.2 then
+     local measured=(pos-previous.pos)/elapsed
+     local oldVelocity=previous.velocity
+     local velocity=oldVelocity and oldVelocity:Lerp(measured,0.55) or measured
+     samples[ball].velocity=velocity
+     if measured.Magnitude<450 and velocity.Magnitude>15 then
+      local goal=nil
+      local distance=math.huge
+      for _,candidate in goals:GetChildren() do
+       if candidate:IsA("BasePart") then
+        local d=(candidate.Position-root.Position).Magnitude
+        if d<distance then distance=d; goal=candidate end
+       end
+      end
+      if goal and distance<85 then
+       local normal=goal.CFrame.LookVector
+       local toward=velocity:Dot(normal)
+       if math.abs(toward)>12 then
+        local goalTime=(goal.Position-pos):Dot(normal)/toward
+        local keeperTime=(root.Position-pos):Dot(normal)/toward
+        if goalTime>0 and goalTime<1.5 and keeperTime>0 and keeperTime<0.8 then
+         local acceleration=Vector3.zero
+         if oldVelocity then
+          local ay=(velocity.Y-oldVelocity.Y)/elapsed
+          acceleration=Vector3.new(0,math.clamp(ay,-workspace.Gravity,0),0)
+         end
+         local radius=ball.Size.Y*0.5
+         local groundY=goal.Position.Y-goal.Size.Y*0.5+radius
+         local filters={engine,character}
+         for _,other in Players:GetPlayers() do
+          if other.Character then table.insert(filters,other.Character) end
+         end
+         local params=RaycastParams.new()
+         params.FilterType=Enum.RaycastFilterType.Exclude
+         params.FilterDescendantsInstances=filters
+         local ground=workspace:Raycast(pos+Vector3.new(0,2,0),Vector3.new(0,-14,0),params)
+         if ground then groundY=ground.Position.Y+radius end
+         local rolling=pos.Y<=groundY+0.9 and math.abs(velocity.Y)<6
+         if rolling then acceleration=Vector3.zero; velocity=Vector3.new(velocity.X,0,velocity.Z) end
+         local goalHit=pos+velocity*goalTime+acceleration*(0.5*goalTime*goalTime)
+         goalHit=Vector3.new(goalHit.X,math.max(goalHit.Y,groundY),goalHit.Z)
+         local localHit=goal.CFrame:PointToObjectSpace(goalHit)
+         if math.abs(localHit.X)<goal.Size.X/2+1 and math.abs(localHit.Y)<goal.Size.Y/2+1 then
+          local intercept=pos+velocity*keeperTime+acceleration*(0.5*keeperTime*keeperTime)
+          intercept=Vector3.new(intercept.X,math.max(intercept.Y,groundY),intercept.Z)
+          local offset=root.CFrame:VectorToObjectSpace(intercept-root.Position)
+          local high=intercept.Y>root.Position.Y+1.2
+          local lateral = math.abs(offset.X)
+          local ballDistance = (pos-root.Position).Magnitude
+          local needsJump = config.JumpDive and intercept.Y>root.Position.Y+config.JumpHeight
+          local leadTime = config.MinLeadTime + (config.MaxLeadTime-config.MinLeadTime)*math.clamp(lateral/config.MaxDiveReach,0,1)
+          if not high then
+           leadTime=math.max(leadTime,config.LowLeadTime+0.06*math.clamp(lateral/config.MaxDiveReach,0,1))
+          end
+          if needsJump then leadTime+=config.JumpDelay end
+          stats.prediction = {
+           position = {x=intercept.X,y=intercept.Y,z=intercept.Z},
+           seconds = keeperTime,
+           distance = ballDistance,
+           lateral = lateral,
+           radius = config.Radius,
+           ready = ballDistance<=config.Radius and keeperTime<=leadTime,
+          }
+          if ballDistance<=config.Radius and keeperTime<=leadTime and lateral<config.MaxDiveReach and intercept.Y<goal.Position.Y+goal.Size.Y/2+3 then
+           if not best or keeperTime<best.time then
+            best={time=keeperTime,right=offset.X>=0,high=high,jump=needsJump}
+           end
+          end
+         end
+        end
+       end
+      end
+     end
+    end
+   end
+  end
+ end
+ for ball in samples do if not ball.Parent then samples[ball]=nil end end
+ local equipped=character:FindFirstChildOfClass("Tool")
+ if (equipped and string.lower(equipped.Name)=="tackle") or not enabled or player:GetAttribute("Position")~="GK" or UIS:GetFocusedTextBox() or not isrbxactive() then return end
+ if best and now-lastDive>config.Cooldown then
+  local key=best.high and (best.right and 0x45 or 0x51) or (best.right and 0x43 or 0x5A)
+  lastDive=now
+  stats.dives+=1
+  stats.last=(best.jump and "Jump " or "")..(best.high and "High " or "Low ")..(best.right and "right" or "left")
+  local humanoid=character:FindFirstChildOfClass("Humanoid")
+  local jumpFirst=best.jump and humanoid and humanoid.FloorMaterial~=Enum.Material.Air
+  local function pressDive()
+   if not STATE.alive() or not enabled or player.Character~=character or not isrbxactive() or UIS:GetFocusedTextBox() then return end
+   keypress(key); held[key]=true
+   task.delay(0.09,function() keyrelease(key); held[key]=nil end)
+  end
+  if jumpFirst then
+   keypress(0x20); held[0x20]=true
+   task.delay(0.06,function() keyrelease(0x20); held[0x20]=nil end)
+   task.delay(config.JumpDelay,pressDive)
+  else
+   pressDive()
+  end
+ end
+end)
+print("FUT predictor active. Radius: 32 studs. Timed interception; G toggles.")
+
+end
+
+do
+local STATE=createState()
+local Players=game:GetService("Players")
+local RunService=game:GetService("RunService")
+local UIS=game:GetService("UserInputService")
+local player=Players.LocalPlayer
+local engine=workspace:WaitForChild("Game"):WaitForChild("Engine")
+local config={Radius=25,Reach=5,LeadTime=0.30,JumpLead=0.38,Cooldown=1.1}
+local stats={enabled=true,actions=0,last="Waiting for an incoming high ball"}
+getgenv().FUTAutoChest=stats
+getgenv().FUTAutoChestConfig=config
+local samples={}
+local held={}
+local lastAction=0
+local function valid()
+ local c=player.Character
+ local t=c and c:FindFirstChildOfClass("Tool")
+ return c and t and string.lower(t.Name)=="tackle" and isrbxactive() and not UIS:GetFocusedTextBox()
+end
+local function tap(key,duration)
+ keypress(key)
+ held[key]=true
+ task.delay(duration,function()
+  keyrelease(key)
+  held[key]=nil
+ end)
+end
+STATE.onCleanup(function()
+ stats.enabled=false
+ for key in held do keyrelease(key) end
+end)
+STATE.connect(UIS.InputBegan,function(input,processed)
+ if not processed and input.KeyCode==Enum.KeyCode.J then
+  stats.enabled=not stats.enabled
+  print("FUT auto chest: "..tostring(stats.enabled))
+ end
+end)
+STATE.connect(RunService.Heartbeat,function()
+ local now=os.clock()
+ local c=player.Character
+ local root=c and c:FindFirstChild("HumanoidRootPart")
+ local humanoid=c and c:FindFirstChildOfClass("Humanoid")
+ if not root or not humanoid then return end
+ local best=nil
+ for _,ball in engine:GetChildren() do
+  if ball:IsA("BasePart") and ball.Name=="Ball" then
+   local p=ball.Position
+   local old=samples[ball]
+   samples[ball]={p=p,t=now,v=old and old.v}
+   if old then
+    local dt=now-old.t
+    if dt>0.005 and dt<0.2 then
+     local measured=(p-old.p)/dt
+     local v=old.v and old.v:Lerp(measured,0.6) or measured
+     samples[ball].v=v
+     local delta=p-root.Position
+     local horizontal=Vector3.new(delta.X,0,delta.Z)
+     local relative=v-root.AssemblyLinearVelocity
+     local hv=Vector3.new(relative.X,0,relative.Z)
+     local speed2=hv:Dot(hv)
+     local approaching=horizontal:Dot(hv)<-4 or (horizontal.Magnitude<config.Reach and v.Y< -2)
+     if measured.Magnitude<450 and approaching and delta.Magnitude<config.Radius then
+      local eta
+      if speed2>16 then
+       eta=-horizontal:Dot(hv)/speed2
+      else
+       local fall=math.max(-v.Y,1)
+       eta=math.max(0.03,(p.Y-(root.Position.Y+4))/fall)
+      end
+      local miss=(horizontal+hv*eta).Magnitude
+      if eta>0.025 and eta<0.6 and miss<config.Reach then
+       local ay=old.v and math.clamp((v.Y-old.v.Y)/dt,-workspace.Gravity,0) or 0
+       local targetY=p.Y+v.Y*eta+0.5*ay*eta*eta
+       local grounded=humanoid.FloorMaterial~=Enum.Material.Air
+       local chestY=root.Position.Y+1.1
+       local jumpSpeed=humanoid.UseJumpPower and humanoid.JumpPower or math.sqrt(2*workspace.Gravity*humanoid.JumpHeight)
+       local jumpRise=math.max(0,jumpSpeed*eta-0.5*workspace.Gravity*eta*eta)
+       local needsJump=grounded and targetY>chestY+1.4
+       local expectedChest=chestY+(needsJump and jumpRise or root.AssemblyLinearVelocity.Y*eta)
+       if targetY>root.Position.Y+0.6 and math.abs(targetY-expectedChest)<3 and eta<=(needsJump and config.JumpLead or config.LeadTime) then
+        if not best or eta<best.eta then best={eta=eta,jump=needsJump,ball=ball} end
+       end
+      end
+     end
+    end
+   end
+  end
+ end
+ for ball in samples do if not ball.Parent then samples[ball]=nil end end
+ if not stats.enabled or not valid() or now-lastAction<config.Cooldown or not best then return end
+ lastAction=now
+ stats.actions+=1
+ stats.last=best.jump and "Jump + chest" or "Chest"
+ if best.jump then tap(0x20,0.06) end
+ local delay=best.jump and 0.05 or 0
+ task.delay(delay,function()
+  if STATE.alive() and stats.enabled and player.Character==c and valid() and best.ball.Parent and (best.ball.Position-root.Position).Magnitude<config.Radius then
+   local tool=c:FindFirstChildOfClass("Tool")
+   local client=tool and tool:FindFirstChild("Client")
+   local chest=client and client:FindFirstChild("chest")
+   if chest and chest:IsA("ModuleScript") then
+    local ok,err=pcall(function() require(chest).SetUp() end)
+    if not ok then stats.last=tostring(err) end
+   else
+    tap(0x46,0.1)
+   end
+  end
+ end)
+end)
+print("FUT auto chest active: Tackle equipped, incoming high balls only. J toggles.")
+
+end
+
+do
+local STATE=createState()
+local Players=game:GetService("Players")
+local UIS=game:GetService("UserInputService")
+local RunService=game:GetService("RunService")
+local p=Players.LocalPlayer
+local gameFolder=workspace:WaitForChild("Game")
+local engine=gameFolder:WaitForChild("Engine")
+local goals=gameFolder:WaitForChild("PitchEngine"):WaitForChild("Goals")
+local stats={enabled=true,shots=0,last="Waiting for LMB shot"}
+getgenv().FUTAutoGoal=stats
+local config={MinForwardSpeed=160,MaxForwardSpeed=220,MaxLiftRatio=0.25}
+getgenv().FUTAutoGoalConfig=config
+local armedUntil=0
+local side=1
+local watched={}
+local pending={}
+local function shooting()
+ local c=p.Character
+ local t=c and c:FindFirstChildOfClass("Tool")
+ return t and string.lower(t.Name)=="shoot"
+end
+STATE.connect(UIS.InputBegan,function(input,processed)
+ if processed then return end
+ if input.KeyCode==Enum.KeyCode.K then
+  stats.enabled=not stats.enabled
+  if not stats.enabled then armedUntil=0 end
+ elseif input.UserInputType==Enum.UserInputType.MouseButton1 and stats.enabled and shooting() then
+  side=math.random(0,1)==0 and -1 or 1
+  armedUntil=os.clock()+3
+ end
+end)
+STATE.connect(UIS.InputEnded,function(input)
+ if input.UserInputType==Enum.UserInputType.MouseButton1 and stats.enabled and shooting() and armedUntil>0 then
+  armedUntil=os.clock()+1
+ end
+end)
+local function watch(ball)
+ if not ball:IsA("BasePart") or ball.Name~="Ball" or watched[ball] then return end
+ watched[ball]=true
+ STATE.connect(ball.ChildAdded,function(child)
+  if not child:IsA("BodyVelocity") then return end
+  task.defer(function()
+   if not STATE.alive() or not stats.enabled or child.Name~="ShootVelocity" or os.clock()>armedUntil or not shooting() then return end
+   local c=p.Character
+   local root=c and c:FindFirstChild("HumanoidRootPart")
+   if not root or (ball.Position-root.Position).Magnitude>12 then return end
+   local team=string.lower(p.Team and p.Team.Name or "")
+   local goalName=string.find(team,"away") and "agoal" or (string.find(team,"home") and "hgoal" or nil)
+   local goal=goalName and goals:FindFirstChild(goalName)
+   if not goal or not goal:IsA("BasePart") then stats.last="Cannot identify opponent goal"; return end
+   local target=goal.CFrame:PointToWorldSpace(Vector3.new(side*(goal.Size.X/2-2.5),goal.Size.Y/2-2.3,0))
+   local delta=target-ball.Position
+   local horizontal=Vector3.new(delta.X,0,delta.Z)
+   local speed=math.clamp(Vector3.new(child.Velocity.X,0,child.Velocity.Z).Magnitude,config.MinForwardSpeed,config.MaxForwardSpeed)
+   local flight=math.max(horizontal.Magnitude/speed,0.15)
+   local lift=0
+   for _,force in ball:GetChildren() do
+    if force:IsA("BodyForce") then lift+=force.Force.Y/math.max(ball.AssemblyMass,0.01) end
+   end
+   local gravity=math.clamp(workspace.Gravity-lift,0,workspace.Gravity)
+   local vertical=math.clamp(delta.Y/flight+0.5*gravity*flight,0,speed*config.MaxLiftRatio)
+   local velocity=horizontal/flight+Vector3.new(0,vertical,0)
+   child.Velocity=velocity
+   ball.AssemblyLinearVelocity=velocity
+   pending[ball]={body=child,target=target,speed=speed,expires=os.clock()+0.5}
+   armedUntil=0
+   stats.shots+=1
+   stats.last=side<0 and "Upper corner A" or "Upper corner B"
+  end)
+ end)
+end
+for _,ball in engine:GetChildren() do watch(ball) end
+STATE.connect(engine.ChildAdded,watch)
+STATE.connect(RunService.Heartbeat,function()
+ for ball,shot in pending do
+  if not ball.Parent or not stats.enabled or os.clock()>shot.expires then
+   pending[ball]=nil
+  elseif not shot.body.Parent then
+   local delta=shot.target-ball.Position
+   local horizontal=Vector3.new(delta.X,0,delta.Z)
+   local flight=math.max(horizontal.Magnitude/shot.speed,0.1)
+   local lift=0
+   for _,force in ball:GetChildren() do
+    if force:IsA("BodyForce") then lift+=force.Force.Y/math.max(ball.AssemblyMass,0.01) end
+   end
+   local gravity=math.clamp(workspace.Gravity-lift,0,workspace.Gravity)
+   local vertical=math.clamp(delta.Y/flight+0.5*gravity*flight,0,shot.speed*config.MaxLiftRatio)
+   ball.AssemblyLinearVelocity=horizontal/flight+Vector3.new(0,vertical,0)
+   pending[ball]=nil
+  end
+ end
+end)
+STATE.onCleanup(function() stats.enabled=false; table.clear(pending) end)
+print("FUT corner aim active: Shoot tool + LMB. K toggles.")
+
+end
+
+do
+local STATE=createState()
+local Players=game:GetService("Players")
+local UIS=game:GetService("UserInputService")
+local RunService=game:GetService("RunService")
+local player=Players.LocalPlayer
+local engine=workspace:WaitForChild("Game"):WaitForChild("Engine")
+local config={Radius=6,Prediction=0.09,Cooldown=0.12}
+local stats={enabled=true,attempts=0,last="Waiting for an attacking action"}
+getgenv().FUTFastReact=stats
+getgenv().FUTFastReactConfig=config
+local samples={}
+local last={}
+local attackUntil=0
+STATE.connect(UIS.InputBegan,function(input,processed)
+ if processed then return end
+ if input.KeyCode==Enum.KeyCode.V then
+  stats.enabled=not stats.enabled
+ elseif input.UserInputType==Enum.UserInputType.MouseButton1 then
+  attackUntil=os.clock()+0.6
+ end
+end)
+STATE.connect(UIS.InputEnded,function(input)
+ if input.UserInputType==Enum.UserInputType.MouseButton1 then attackUntil=os.clock()+0.45 end
+end)
+STATE.onCleanup(function() stats.enabled=false end)
+STATE.connect(RunService.Heartbeat,function()
+ local now=os.clock()
+ local c=player.Character
+ local root=c and c:FindFirstChild("HumanoidRootPart")
+ if not root then return end
+ local tool=c:FindFirstChildOfClass("Tool")
+ local name=tool and string.lower(tool.Name) or ""
+ local active=stats.enabled and (name=="shoot" or name=="dribble" or name=="tackle") and isrbxactive() and not UIS:GetFocusedTextBox() and (now<attackUntil or UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1))
+ local feet={}
+ for _,part in c:GetChildren() do
+  if part:IsA("BasePart") and (part.Name=="LeftFoot" or part.Name=="RightFoot" or part.Name=="Left Leg" or part.Name=="Right Leg") then table.insert(feet,part) end
+ end
+ for _,ball in engine:GetChildren() do
+  if ball:IsA("BasePart") and ball.Name=="Ball" then
+   local pos=ball.Position
+   local old=samples[ball]
+   samples[ball]={p=pos,t=now}
+   if active and old and now-old.t>0.005 and now-old.t<0.2 and now-(last[ball] or 0)>config.Cooldown then
+    local velocity=(pos-old.p)/(now-old.t)
+    if velocity.Magnitude<450 and (pos-root.Position).Magnitude<config.Radius then
+     local foot=nil
+     local distance=math.huge
+     for _,candidate in feet do
+      local delta=pos-candidate.Position
+      local relative=velocity-root.AssemblyLinearVelocity
+      local prediction=delta+relative*config.Prediction
+      if (prediction.Magnitude<delta.Magnitude or delta.Magnitude<2.5) and prediction.Magnitude<3 and delta.Magnitude<distance then
+       foot=candidate
+       distance=delta.Magnitude
+      end
+     end
+     if foot then
+      last[ball]=now
+      firetouchinterest(foot,ball,1)
+      firetouchinterest(foot,ball,0)
+      stats.attempts+=1
+      stats.last="Early foot contact attempted"
+     end
+    end
+   end
+  end
+ end
+ for ball in samples do
+  if not ball.Parent then samples[ball]=nil; last[ball]=nil end
+ end
+end)
+print("FUT fast react active. Attack with LMB; V toggles.")
+
+end
+
+do
+local STATE=createState()
+local player=game:GetService("Players").LocalPlayer
+local module=require(player.PlayerScripts.Client.Client.Management.Player.Stamina)
+local originalDrain=module.Config.DrainRate
+local originalRegen=module.Config.RegenRate
+local stats={enabled=false}
+getgenv().FUTInfStamina=stats
+local function setEnabled(value)
+ stats.enabled=value
+ if value then
+  module.Config.DrainRate=-module.Config.MaxStamina
+  module.Config.RegenRate=module.Config.MaxStamina*10
+  module:UpdateStamina(1)
+  module.Config.DrainRate=0
+ else
+  module.Config.DrainRate=originalDrain
+  module.Config.RegenRate=originalRegen
+ end
+end
+stats.SetEnabled=setEnabled
+STATE.onCleanup(function() setEnabled(false) end)
+setEnabled(true)
+print("FUT infinite stamina enabled; original rates restore when disabled.")
+
+end
+
+do
+local STATE=createState()
+local player=game:GetService("Players").LocalPlayer
+local stats={enabled=true,active=false}
+getgenv().FUTGKHands=stats
+local originals={}
+local function restore()
+ for part,original in originals do
+  if part.Parent then
+   part.Size=original.Size
+   part.CanCollide=original.CanCollide
+   part.Massless=original.Massless
+  end
+ end
+ table.clear(originals)
+ stats.active=false
+end
+local function update()
+ local character=player.Character
+ local tool=character and character:FindFirstChild("GK")
+ local active=stats.enabled and tool and tool:IsA("Tool")
+ if not active then restore(); return end
+ for _,name in {"LeftHand","RightHand"} do
+  local hand=character:FindFirstChild(name)
+  if hand and hand:IsA("BasePart") then
+   if not originals[hand] then originals[hand]={Size=hand.Size,CanCollide=hand.CanCollide,Massless=hand.Massless} end
+   hand.CanCollide=false
+   hand.Massless=true
+   if hand.Size~=Vector3.new(3,3,3) then hand.Size=Vector3.new(3,3,3) end
+  end
+ end
+ stats.active=true
+end
+stats.SetEnabled=function(v) stats.enabled=v; update() end
+STATE.onCleanup(function() stats.enabled=false; restore() end)
+STATE.connect(game:GetService("RunService").Heartbeat,update)
+update()
+print("GK hands ready: 3x3x3 only with GK equipped.")
+
+end
+
+do
+local STATE=createState()
+local player=game:GetService("Players").LocalPlayer
+local UIS=game:GetService("UserInputService")
+local stats={enabled=true,modules=0}
+getgenv().FUTNoSkillCooldown=stats
+local locks={}
+local cachedTool=nil
+local function refresh()
+ local character=player.Character
+ local tool=(character and character:FindFirstChild("Dribble")) or player.Backpack:FindFirstChild("Dribble")
+ if not tool or tool==cachedTool then return end
+ cachedTool=tool
+ table.clear(locks)
+ local client=tool:FindFirstChild("Client")
+ if not client then return end
+ for _,child in client:GetChildren() do
+  if child:IsA("ModuleScript") then
+   local ok,module=pcall(require,child)
+   if ok and type(module)=="table" and type(module.SetUp)=="function" then
+    for _,v in debug.getupvalues(module.SetUp) do
+     if type(v)=="table" and type(rawget(v,1))=="number" and type(rawget(v,2))=="boolean" and rawget(v,3)==nil then
+      locks[v]=true
+     end
+    end
+   end
+  end
+ end
+ local n=0
+ for _ in locks do n+=1 end
+ stats.modules=n
+end
+local function unlock()
+ if not stats.enabled then return end
+ _G.Roullete=false
+ for t in locks do t[2]=false end
+end
+stats.SetEnabled=function(v) stats.enabled=v end
+STATE.connect(UIS.InputBegan,function(_,processed)
+ if processed or not stats.enabled then return end
+ local c=player.Character
+ if not c or not c:FindFirstChild("Dribble") or UIS:GetFocusedTextBox() then return end
+ unlock()
+end)
+local elapsed=0
+STATE.connect(game:GetService("RunService").Heartbeat,function(dt)
+ elapsed+=dt
+ if elapsed<0.06 then return end
+ elapsed=0
+ local c=player.Character
+ if stats.enabled and c and c:FindFirstChild("Dribble") then
+  refresh()
+  unlock()
+ end
+end)
+STATE.onCleanup(function() stats.enabled=false end)
+refresh()
+print("Dribble local skill locks ready: "..tostring(stats.modules)..".")
+
+end
+
+do
+local STATE=createState()
+local Players=game:GetService("Players")
+local RunService=game:GetService("RunService")
+local UIS=game:GetService("UserInputService")
+local player=Players.LocalPlayer
+local engine=workspace:WaitForChild("Game"):WaitForChild("Engine")
+local stats={enabled=true,holding=false,heldSeconds=0,attempts=0,last="Waiting for a ball"}
+getgenv().FUTAutoCatch=stats
+local samples={}
+local lastAttempt=0
+local diveStarted=nil
+local heldSince=nil
+local lastHeld=nil
+
+local function holding()
+ local c=player.Character
+ local carrier=c and c:FindFirstChild("Ball")
+ local ref=carrier and carrier:FindFirstChild("ballobj")
+ return carrier and carrier:FindFirstChild("catch") and ref and ref.Value~=nil
+end
+stats.IsHolding=holding
+STATE.onCleanup(function() stats.enabled=false end)
+STATE.connect(RunService.Heartbeat,function()
+ local now=os.clock()
+ if _G.Diving then
+  if not diveStarted then diveStarted=now end
+ else
+  diveStarted=nil
+ end
+ local catchReady=not diveStarted or now-diveStarted>=0.28
+ local held=holding()
+ stats.holding=not not held
+ if held then
+  if not heldSince then heldSince=now end
+  stats.heldSeconds=math.min(5,math.floor(now-heldSince)+1)
+  stats.last="Holding "..tostring(stats.heldSeconds).."/5"
+  local carrier=player.Character and player.Character:FindFirstChild("Ball")
+  local ref=carrier and carrier:FindFirstChild("ballobj")
+  lastHeld=ref and ref.Value
+  return
+ elseif heldSince then
+  heldSince=nil
+  stats.heldSeconds=0
+  stats.last="Released"
+ end
+ local c=player.Character
+ local root=c and c:FindFirstChild("HumanoidRootPart")
+ local tool=c and c:FindFirstChild("GK")
+ if not root then return end
+ for _,ball in engine:GetChildren() do
+  if ball:IsA("BasePart") and ball.Name=="Ball" then
+   local pos=ball.Position
+   local old=samples[ball]
+   samples[ball]={p=pos,t=now}
+   if stats.enabled and catchReady and tool and now-lastAttempt>1.0 and old and isrbxactive() and not UIS:GetFocusedTextBox() then
+    local dt=now-old.t
+    if dt>0.005 and dt<0.2 then
+     local v=(pos-old.p)/dt-root.AssemblyLinearVelocity
+     local delta=pos-root.Position
+     local speed2=v:Dot(v)
+     if speed2>100 and v.Magnitude<450 and delta.Magnitude<24 and delta:Dot(v)<20 then
+      local eta=-delta:Dot(v)/speed2
+      local predicted=delta+v*eta
+      local localHit=root.CFrame:VectorToObjectSpace(predicted)
+      if eta> -0.15 and eta<0.6 and predicted.Magnitude<13 then
+       local client=tool:FindFirstChild("Client")
+       local high=pos.Y+v.Y*eta>root.Position.Y+0.5
+       local module=client and client:FindFirstChild(high and "catchhigh" or "catchlow")
+       if module then
+        lastAttempt=now
+        stats.attempts+=1
+        stats.last=high and "High catch attempt" or "Low catch attempt"
+        task.spawn(function()
+         local ok,err=pcall(function() require(module).new() end)
+         if not ok then stats.last=tostring(err) end
+        end)
+       end
+      end
+     end
+    end
+   end
+  end
+ end
+ for ball in samples do if not ball.Parent then samples[ball]=nil end end
+end)
+print("Independent auto catch active. Native five-second drop; no added pause.")
+
+end
+
+do
+local STATE=createState()
+local Players=game:GetService("Players")
+local UIS=game:GetService("UserInputService")
+local RunService=game:GetService("RunService")
+local player=Players.LocalPlayer
+local engine=workspace:WaitForChild("Game"):WaitForChild("Engine")
+local config={OpponentRadius=10,BallRadius=7}
+local stats={enabled=true,active=false,last="Waiting for nearby pressure"}
+getgenv().FUTAutoShield=stats
+getgenv().FUTAutoShieldConfig=config
+local changedHumanoid=nil
+local originalRotate=nil
+local function release()
+ if changedHumanoid and changedHumanoid.Parent then changedHumanoid.AutoRotate=originalRotate end
+ changedHumanoid=nil
+ stats.active=false
+end
+stats.SetEnabled=function(v) stats.enabled=v; if not v then release() end end
+STATE.onCleanup(function() stats.enabled=false; release() end)
+STATE.connect(RunService.Heartbeat,function(dt)
+ local c=player.Character
+ local root=c and c:FindFirstChild("HumanoidRootPart")
+ local humanoid=c and c:FindFirstChildOfClass("Humanoid")
+ local tool=c and c:FindFirstChildOfClass("Tool")
+ if not stats.enabled or not root or not humanoid or not tool or string.lower(tool.Name)~="dribble" or _G.Diving or _G.Catching or not isrbxactive() or UIS:GetFocusedTextBox() or UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then release(); return end
+ local ball=nil
+ for _,b in engine:GetChildren() do
+  if b:IsA("BasePart") and b.Name=="Ball" then
+   local owner=b:FindFirstChild("NetworkOwner")
+   if owner and owner.Value==player and (b.Position-root.Position).Magnitude<config.BallRadius then ball=b; break end
+  end
+ end
+ if not ball then release(); return end
+ local opponent=nil
+ local distance=config.OpponentRadius
+ for _,other in Players:GetPlayers() do
+  local team=other.Team and string.lower(other.Team.Name) or ""
+  local ownTeam=player.Team and string.lower(player.Team.Name) or ""
+  local sameSide=(string.find(team,"home") and string.find(ownTeam,"home")) or (string.find(team,"away") and string.find(ownTeam,"away"))
+  if other~=player and not sameSide then
+   local r=other.Character and other.Character:FindFirstChild("HumanoidRootPart")
+   if r then local d=(r.Position-root.Position).Magnitude; if d<distance then distance=d; opponent=r end end
+  end
+ end
+ if not opponent then release(); return end
+ local away=root.Position-opponent.Position
+ away=Vector3.new(away.X,0,away.Z)
+ if away.Magnitude<0.1 then release(); return end
+ if changedHumanoid~=humanoid then release(); changedHumanoid=humanoid; originalRotate=humanoid.AutoRotate end
+ humanoid.AutoRotate=false
+ local target=CFrame.lookAt(root.Position,root.Position+away.Unit)
+ root.CFrame=root.CFrame:Lerp(target,1-math.exp(-12*dt))
+ stats.active=true
+ stats.last="Turning away from nearby opponent"
+end)
+print("Auto shield positioning active with Dribble. Releases for LMB actions.")
+
+end
+
+do
+local STATE=createState()
+local player=game:GetService("Players").LocalPlayer
+local stats={enabled=true,applied=false}
+local config={Reach=3}
+getgenv().FUTFootReach=stats
+getgenv().FUTFootReachConfig=config
+local originals={}
+local function restore()
+ for foot,old in originals do foot.Scale=old.Scale; foot.Offset=old.Offset end
+ table.clear(originals)
+ stats.applied=false
+end
+local function update()
+ if not stats.enabled then restore(); return end
+ local character=player.Character
+ local tool=(character and character:FindFirstChild("Dribble")) or player.Backpack:FindFirstChild("Dribble")
+ local source=tool and tool:FindFirstChild("HitboxConfig")
+ local physical=character and character:FindFirstChild("RightFoot")
+ if not source or not physical then return end
+ local cfg=require(source)
+ local foot=cfg.Limbs and cfg.Limbs.Foot
+ if not foot then return end
+ if not originals[foot] then originals[foot]={Scale=foot.Scale,Offset=foot.Offset} end
+ local size=physical.Size
+ foot.Scale=Vector3.new(config.Reach/math.max(size.X,0.1),math.max(originals[foot].Scale.Y,1),config.Reach/math.max(size.Z,0.1))
+ stats.applied=true
+end
+stats.SetEnabled=function(v) stats.enabled=v; update() end
+STATE.onCleanup(function() stats.enabled=false; restore() end)
+local elapsed=0
+STATE.connect(game:GetService("RunService").Heartbeat,function(dt)
+ elapsed+=dt
+ if elapsed>=0.25 then elapsed=0; update() end
+end)
+update()
+print("Foot reach active: 3-stud horizontal foot hitboxes for Dribble skills.")
+
+end
+
+do
+local STATE=createState()
+local Rayfield=loadstring(game:HttpGet("https://sirius.menu/gen2"))()
+local window=Rayfield:CreateWindow({name="FUT Hub",subtitle="Match controls",sidebarLayout=true,ToggleUIKeybind=Enum.KeyCode.RightShift})
+STATE.onCleanup(function() window:Unload() end)
+getgenv().FUTHubWindow=window
+local features=window:CreateTab({name="Features"})
+local keeper=window:CreateTab({name="Goalkeeper"})
+local ball=window:CreateTab({name="Ball control"})
+local shooting=window:CreateTab({name="Shooting"})
+local controls={}
+local function feature(name,key,description)
+ local s=getgenv()[key]
+ local toggle=features:CreateToggle({
+  name=name,description=description,value=s and s.enabled or false,forgetState=true,
+  callback=function(v)
+   local current=getgenv()[key]
+   if current then
+    if current.SetEnabled then current.SetEnabled(v) else current.enabled=v end
+   end
+  end,
+ })
+ table.insert(controls,{key=key,handle=toggle})
+ return toggle
+end
+feature("Auto dive","FUTAutoDive","G toggle · predictive saves and jump-dives")
+feature("Auto catch","FUTAutoCatch","GK only · 0.28s catch delay during dives · native 5-second drop")
+feature("Auto chest","FUTAutoChest","J toggle · Tackle equipped · approaching high balls")
+feature("Corner aim","FUTAutoGoal","K toggle · Shoot + LMB · random upper corner")
+feature("Fast react","FUTFastReact","V toggle · early foot contact during LMB actions")
+feature("GK hands 3×3×3","FUTGKHands","Only while GK is equipped; restores normal size when off")
+feature("No skill cooldown","FUTNoSkillCooldown","Dribble skills · removes local skill locks")
+feature("Auto shield","FUTAutoShield","Dribble · turns away from opponents while you own a nearby ball")
+feature("Foot reach","FUTFootReach","Wider foot contact for Dribble skills")
+feature("Infinite stamina","FUTInfStamina","Stops stamina drain; disabling restores normal rates")
+features:CreateButton({name="Turn everything off",callback=function()
+ for _,entry in controls do entry.handle:Set(false) end
+end})
+features:CreateText({name="Menu",text="Right Shift shows or hides this menu. Keep Roblox focused for automatic key presses."})
+local function slider(tab,name,key,field,min,max,step,suffix)
+ local settings=getgenv()[key]
+ tab:CreateSlider({
+  name=name,range={min,max},increment=step,value=settings[field],suffix=suffix,forgetState=true,
+  callback=function(v)
+   local current=getgenv()[key]
+   if current then current[field]=v end
+  end,
+ })
+end
+keeper:CreateToggle({name="Jump dives",value=getgenv().FUTAutoDiveConfig.JumpDive,forgetState=true,callback=function(v) getgenv().FUTAutoDiveConfig.JumpDive=v end})
+slider(keeper,"Dive radius","FUTAutoDiveConfig","Radius",10,60,1," studs")
+slider(keeper,"Dive reach","FUTAutoDiveConfig","MaxDiveReach",5,25,1," studs")
+slider(keeper,"Jump before dive","FUTAutoDiveConfig","JumpDelay",0.04,0.18,0.01," s")
+slider(ball,"Foot reach","FUTFootReachConfig","Reach",2,6,0.5," studs")
+slider(ball,"Chest radius","FUTAutoChestConfig","Radius",10,40,1," studs")
+slider(ball,"Chest reach","FUTAutoChestConfig","Reach",2,7,0.5," studs")
+slider(ball,"Fast react radius","FUTFastReactConfig","Radius",3,9,0.5," studs")
+slider(ball,"Fast react prediction","FUTFastReactConfig","Prediction",0.03,0.15,0.01," s")
+slider(shooting,"Minimum forward power","FUTAutoGoalConfig","MinForwardSpeed",80,220,5," studs/s")
+slider(shooting,"Lift limit","FUTAutoGoalConfig","MaxLiftRatio",0.05,0.4,0.01,"")
+shooting:CreateText({name="Corner aim",text="Targets a random upper corner of the opponent goal. Shot accuracy and contested possession are still being tuned."})
+local elapsed=0
+STATE.connect(game:GetService("RunService").Heartbeat,function(dt)
+ elapsed+=dt
+ if elapsed<0.2 then return end
+ elapsed=0
+ for _,entry in controls do
+  local s=getgenv()[entry.key]
+  local value=s and s.enabled or false
+  if entry.handle.value~=value then entry.handle:Set(value,true) end
+ end
+end)
+print("FUT Hub ready: five feature toggles, settings tabs, Right Shift menu.")
+
+end
+
